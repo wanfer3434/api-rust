@@ -1,0 +1,151 @@
+// Estándar
+use std::{net::SocketAddr, sync::Arc, collections::HashMap};
+// Terceros
+use dotenv::dotenv;
+use tokio;
+use chrono::Utc;
+use hyper::Method;
+
+// Axum y componentes
+use axum::{
+    extract::{Query, State},
+    routing::{get, post},
+    Json, Router,
+};
+
+// Middleware CORS
+use tower_http::cors::{Any, CorsLayer};
+use axum::http::StatusCode;
+use std::collections::HashMap;
+// Base de datos
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+
+#[derive(Debug, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
+struct Producto {
+    id: Option<i64>,
+    nombre: String,
+    precio: f64,
+    color: String,
+    tipo: String,
+    fecha_agregado: String,
+    imagen: Option<String>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    db: Arc<SqlitePool>,
+}
+#[tokio::main]
+async fn main() {
+    dotenv().ok();
+
+    // Obtener la URL de la b1ase de datos
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL no está definido en el entorno");
+
+    // Crear el pool de conexión
+    let pool = SqlitePoolOptions::new()
+        .connect(&database_url)
+        .await
+        .expect("No se pudo conectar a la base de datos");
+
+    let state = AppState {
+        db: Arc::new(pool),
+    };
+
+    // Configurar CORS
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(Any);
+
+    // Crear el router
+    let app = Router::new()
+        .route("/", get(root))
+        .route("/saludo", get(saludo))
+        .route("/producto", post(crear_producto))
+        .route("/productos", get(obtener_productos))
+        .route("/buscar", get(buscar_producto))
+        .with_state(state)
+        .layer(cors);
+
+    // Dirección del servidor
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    println!("Servidor corriendo en http://{}", addr);
+    // No necesitas crear el listener manualmente
+    axum::serve(
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("No se pudo enlazar el puerto"),
+    app,
+     )
+        .await
+        .expect("Error al iniciar el servidor");
+}
+async fn buscar_producto(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Vec<Producto>> {
+    // Obtenemos el parámetro "q" de la query string, con un valor por defecto vacío si no existe
+    let query = params.get("q").cloned().unwrap_or_default();
+    let pattern = format!("%{}%", query);
+
+    // Ejecutamos la consulta a la base de datos con el patrón
+    let productos = sqlx::query_as::<_, Producto>(
+        "SELECT * FROM productos WHERE nombre LIKE ? OR descripcion LIKE ?",
+    )
+    .bind(&pattern)
+    .bind(&pattern)
+    .fetch_all(&*state.db)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(productos))
+}
+async fn root() -> &'static str {
+    "¡Hola desde Rust y Axum!"
+}
+
+async fn saludo() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "mensaje": "Hola, bienvenido a mi API" }))
+}
+
+async fn crear_producto(
+    State(state): State<AppState>,
+    Json(producto): Json<Producto>,
+) -> Json<serde_json::Value> {
+    let fecha_actual = Utc::now().to_rfc3339();
+    let imagen = producto.imagen.clone().unwrap_or_default();
+    println!("📦 Recibido: {:?}", producto);
+    let resultado = sqlx::query(
+        "INSERT INTO productos (nombre, precio, color, tipo, fecha_agregado, imagen) VALUES (?, ?, ?, ?, ?, ?)"
+	)	
+        .bind(&producto.nombre)
+        .bind(&producto.precio)
+        .bind(&producto.color)
+        .bind(&producto.tipo)
+        .bind(&fecha_actual)
+        .bind(&imagen)
+        .execute(&*state.db)
+        .await;
+
+        match resultado {
+           Ok(_) => Json(serde_json::json!({ "mensaje": "Producto guardado correctamente" })),
+           Err(err) => {
+               eprintln!("Error al guardar el producto: {}", err);
+               Json(serde_json::json!({ "error": "Error al guardar el producto" }))
+           }
+        }		
+}
+
+async fn obtener_productos(State(state): State<AppState>) -> Json<Vec<Producto>> {
+    let rows = sqlx::query_as!(
+        Producto,
+        "SELECT id, nombre, precio, color, tipo, fecha_agregado, imagen  FROM productos"
+    )
+    .fetch_all(&*state.db)
+    .await
+    .unwrap_or_default();
+
+    Json(rows)
+}
