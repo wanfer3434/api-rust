@@ -14,7 +14,9 @@ use hyper::{header, Method};
 use serde_json::json;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use tower_http::{cors::{Any, CorsLayer}, services::ServeDir};
-
+use headless_chrome::{Browser, LaunchOptions};
+use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
+//use std::path::Path;
 
 // =======================
 // Estructuras de datos
@@ -82,6 +84,7 @@ async fn main() {
         .route("/buscar", get(buscar_producto))
         .route("/banners", get(obtener_banners))
 	.route("/chatbot", post(chatbot))
+	.route("/screenshot", get(generar_screenshot))
         .nest_service("/static", ServeDir::new("./static"))
         .with_state(state)
 	.route("/descargar-db", get(descargar_db))
@@ -253,3 +256,38 @@ async fn descargar_db() -> impl IntoResponse {
     }
 }
 
+async fn generar_screenshot() -> impl IntoResponse {
+    let url = "http://localhost:3000/"; // URL de tu frontend Flutter web
+    let output_path = "./static/screenshot.png";
+
+    // Lanzar navegador en modo headless
+    let browser = Browser::new(
+    LaunchOptions::default_builder()
+        .headless(true) // aseguramos que corra en modo headless
+        .build()
+        .unwrap(),
+    ).unwrap();
+
+    let tab = browser.new_tab().unwrap();
+
+    // Navegar a la URL de tu app
+    tab.navigate_to(url).unwrap();
+    tab.wait_until_navigated().unwrap();
+
+    // Capturar screenshot
+    let png_data = tab.capture_screenshot(
+    CaptureScreenshotFormatOption::Png, // usamos el import agregado arriba
+    None,
+    None,
+    true,
+    ).unwrap();
+
+
+    std::fs::write(output_path, &png_data).unwrap();
+
+    Response::builder()
+        .header("Content-Type", "image/png")
+        .header("Content-Disposition", "inline; filename=\"screenshot.png\"")
+        .body(axum::body::Body::from(png_data))
+        .unwrap()
+}
