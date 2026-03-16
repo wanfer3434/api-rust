@@ -1,0 +1,256 @@
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use std::fs::read;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use dotenv::dotenv;
+use hyper::{header, Method};
+use serde_json::json;
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use tower_http::{cors::{Any, CorsLayer}, services::ServeDir};
+use headless_chrome::{Browser, LaunchOptions};
+use std::path::Path;
+
+// =======================
+// Estructuras de datos
+// =======================
+
+#[derive(Debug, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
+struct Producto {
+    referencia: String,
+    categoria: String,
+    precio: f64,
+    fecha_venta: String,
+    imagen: Option<String>,
+    cantidad: i32,
+}
+
+
+#[derive(Debug, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
+struct Banner {
+    id: i64,
+    nombre: String,
+    archivo_imagen: String,
+}
+
+// =======================
+// Estado compartido
+// =======================
+
+#[derive(Clone)]
+struct AppState {
+    db: Arc<SqlitePool>,
+}
+
+// =======================
+// Punto de entrada
+// =======================
+
+#[tokio::main]
+async fn main() {
+    dotenv().ok();
+
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL no está definido en el entorno");
+
+    let pool = SqlitePoolOptions::new()
+        .connect(&database_url)
+        .await
+        .expect("No se pudo conectar a la base de datos");
+
+    let state = AppState {
+        db: Arc::new(pool),
+    };
+
+    // Configuración de CORS
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
+
+    // Definición de rutas
+    let app = Router::new()
+        .route("/", get(root))
+        .route("/saludo", get(saludo))
+        .route("/producto", post(crear_producto))
+        .route("/productos", get(obtener_productos))
+        .route("/buscar", get(buscar_producto))
+        .route("/banners", get(obtener_banners))
+	.route("/chatbot", post(chatbot))
+        .nest_service("/static", ServeDir::new("./static"))
+        .with_state(state)
+	.route("/descargar-db", get(descargar_db))
+        .layer(cors);
+
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    println!("🚀 Servidor corriendo en http://{}", addr);
+
+    axum::serve(
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("No se pudo enlazar el puerto"),
+        app,
+    )
+    .await
+    .expect("Error al iniciar el servidor");
+}
+
+// =======================
+// Handlers (manejadores)
+// =======================
+
+async fn root() -> &'static str {
+    "¡Hola desde Rust y Axum!"
+}
+
+async fn saludo() -> Json<serde_json::Value> {
+    Json(json!({ "mensaje": "Hola, bienvenido a mi API" }))
+}
+// 2. Definir la estructura para recibir el JSON del cliente
+#[derive(Debug, Deserialize)]
+struct MensajeUsuario {
+    mensaje: String,
+}
+
+async fn crear_producto(
+    State(state): State<AppState>,
+    Json(mut producto): Json<Producto>,
+) -> Json<serde_json::Value> {
+    let fecha_actual = Utc::now().to_rfc3339();
+    producto.fecha_venta = fecha_actual.clone();
+
+    println!("📦 Recibido: {:?}", producto);
+
+    let resultado = sqlx::query(
+        "INSERT INTO productos (referencia, categoria, precio, fecha_venta, imagen, cantidad)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&producto.referencia)
+    .bind(&producto.categoria)
+    .bind(&producto.precio)
+    .bind(&producto.fecha_venta)
+    .bind(&producto.imagen)
+    .bind(&producto.cantidad)
+    .execute(&*state.db)
+    .await;
+
+    match resultado {
+        Ok(_) => Json(json!({ "mensaje": "Producto guardado correctamente" })),
+        Err(err) => {
+            eprintln!("❌ Error al guardar el producto: {}", err);
+            Json(json!({ "error": "Error al guardar el producto" }))
+        }
+    }
+}
+async fn obtener_productos(State(state): State<AppState>) -> Json<Vec<Producto>> {
+    let productos = sqlx::query_as::<_, Producto>(
+        r#"
+        SELECT
+            referencia,
+            categoria,
+            precio,
+            fecha_venta,
+            imagen,
+            cantidad
+        FROM productos
+        "#,
+    )
+    .fetch_all(&*state.db)
+    .await
+    .unwrap_or_default();
+
+    Json(productos)
+}
+
+async fn buscar_producto(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = match params.get("q") {
+        Some(valor) => valor.clone(),
+        None => "".to_string(),
+    };
+
+    let like_pattern = format!("%{}%", q);
+
+    let result = sqlx::query_as::<_, Producto>(
+        r#"
+        SELECT 
+            referencia,
+            categoria,
+            precio,
+            fecha_venta,
+            imagen,
+            cantidad
+        FROM productos
+        WHERE referencia LIKE ?
+        "#,
+    )
+    .bind(like_pattern)
+    .fetch_all(&*state.db)
+    .await;
+
+    match result {
+        Ok(productos) => Json(productos).into_response(),
+        Err(e) => {
+            eprintln!("❌ Error al buscar productos: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Error interno al buscar productos" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn chatbot(
+    axum::Json(payload): axum::Json<MensajeUsuario>
+) -> axum::Json<serde_json::Value> {
+    println!("📩 Mensaje recibido: {:?}", payload.mensaje);
+
+    let mensaje = payload.mensaje.to_lowercase();
+
+    if mensaje.contains("abogado") || mensaje.contains("asesoría legal") {
+        println!("🔍 Se detectó solicitud de asesoría legal");
+        axum::Json(json!({ "respuesta": "Puedes contactar al abogado Juan Guillermo Jiménez para tu asesoría legal." }))
+    } else if mensaje.contains("hola") || mensaje.contains("buenas") {
+        println!("👋 Saludo detectado");
+        axum::Json(json!({ "respuesta": "¡Hola! ¿En qué puedo ayudarte hoy?" }))
+    } else {
+        println!("🤷‍♂️ Solicitud no entendida");
+        axum::Json(json!({ "respuesta": "Lo siento, no entendí tu solicitud. ¿Podrías especificar mejor?" }))
+    }
+}
+
+async fn obtener_banners(State(state): State<AppState>) -> Json<Vec<Banner>> {
+    let banners = sqlx::query_as::<_, Banner>(
+        "SELECT id, nombre, archivo_imagen FROM banners",
+    )
+    .fetch_all(&*state.db)
+    .await
+    .unwrap_or_default();
+
+    Json(banners)
+}
+
+async fn descargar_db() -> impl IntoResponse {
+    match read("db.sqlite") {
+        Ok(content) => Response::builder()
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Disposition", "attachment; filename=db.sqlite")
+            .body(axum::body::Body::from(content))
+            .unwrap(),
+        Err(_) => Response::builder()
+            .status(500)
+            .body(axum::body::Body::from("Error al leer el archivo"))
+            .unwrap(),
+    }
+}
+
