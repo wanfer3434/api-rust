@@ -1,11 +1,12 @@
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put, delete},
     Json, Router,
 };
+
 use chrono::Utc;
 use dotenv::dotenv;
 use hyper::Method;
@@ -17,6 +18,7 @@ use std::{
     collections::HashMap,
     env, fs,
     net::SocketAddr,
+    path::Path as StdPath,
     sync::Arc,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -26,6 +28,26 @@ use uuid::Uuid;
 // =======================
 // Estructuras de datos
 // =======================
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BannerInput {
+    nombre: String,
+    referencia: Option<String>,
+    costo: f64,
+    archivo_imagen: String,
+    video_url: Option<String>,
+    button_text: Option<String>,
+    activo: i32,
+    orden: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadBannerImageResponse {
+    success: bool,
+    archivo_imagen: String,
+    image_url: String,
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone, FromRow)]
 struct Producto {
@@ -42,13 +64,14 @@ struct Banner {
     id: i32,
     nombre: String,
     referencia: Option<String>,
-    costo: f64,	
+    costo: f64,
     archivo_imagen: String,
     video_url: Option<String>,
     button_text: Option<String>,
     clicks: i32,
+    activo: i32,
+    orden: i32,
 }
-
 #[derive(Debug, Serialize, Deserialize, Clone, FromRow)]
 struct Lead {
     id: i64,
@@ -119,6 +142,32 @@ struct StockBajoItem {
     imagen: String,
     cantidad: i32,
 }
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckoutItem {
+    id: i64,
+    name: String,
+    price: f64,
+    quantity: i32,
+    image_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckoutRequest {
+    items: Vec<CheckoutItem>,
+    total: f64,
+    currency: String,
+    customer_email: Option<String>,
+    customer_name: Option<String>,
+    customer_phone: Option<String>,
+    payment_method: Option<String>, // "nequi", "pse", "card"
+}
+
+#[derive(Debug, Serialize)]
+struct CheckoutResponse {
+    success: bool,
+    checkout_url: String,
+    reference: String,
+}
 
 // =======================
 // Estado compartido
@@ -128,8 +177,11 @@ struct StockBajoItem {
 struct AppState {
     db: Arc<SqlitePool>,
     base_url: String,
+    admin_token: String,
+    wompi_public_key: String,
+    wompi_private_key: String,
+    wompi_integrity_key: String,	
 }
-
 // =======================
 // Main
 // =======================
@@ -140,8 +192,21 @@ async fn main() {
 
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL no está definido en el entorno");
+
     let base_url =
         env::var("BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+
+    let admin_token =
+        env::var("ADMIN_TOKEN").unwrap_or_else(|_| "cambia-esto-por-un-token-seguro".to_string());
+
+    let wompi_public_key =
+        env::var("WOMPI_PUBLIC_KEY").unwrap_or_else(|_| "".to_string());
+
+    let wompi_private_key =
+        env::var("WOMPI_PRIVATE_KEY").unwrap_or_else(|_| "".to_string());
+
+    let wompi_integrity_key =
+        env::var("WOMPI_INTEGRITY_KEY").unwrap_or_else(|_| "".to_string());
 
     println!("🟢 DB URL EN USO => {}", database_url);
     println!("🟢 BASE_URL => {}", base_url);
@@ -158,12 +223,16 @@ async fn main() {
     let state = AppState {
         db: Arc::new(pool),
         base_url,
+        admin_token,
+        wompi_public_key,
+        wompi_private_key,
+        wompi_integrity_key,
     };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
         .route("/", get(root))
@@ -184,6 +253,11 @@ async fn main() {
         .route("/producto_imagenes", get(obtener_producto_imagenes))
         .route("/producto_imagenes", post(crear_producto_imagen))
         .route("/producto_imagen/{id}", post(eliminar_producto_imagen))
+        .route("/admin/upload-banner-image", post(subir_banner_imagen_admin))
+        .route("/admin/banners", post(crear_banner_admin))
+        .route("/admin/banners/{id}", put(actualizar_banner_admin))
+        .route("/admin/banners/{id}", delete(eliminar_banner_admin))
+        .route("/checkout/create", post(crear_checkout))
         .nest_service("/static", ServeDir::new("./static"))
         .with_state(state.clone())
         .layer(cors);
@@ -198,11 +272,59 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("Error al iniciar el servidor");
-}
+}	
 
 // =======================
 // Handlers básicos
 // =======================
+fn validate_admin(headers: &HeaderMap, expected_token: &str) -> Result<(), Response> {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let expected = format!("Bearer {}", expected_token);
+
+    if auth_header != expected {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "No autorizado" })),
+        )
+            .into_response());
+    }
+
+    Ok(())
+}
+
+fn sanitize_filename(input: &str) -> String {
+    let lower = input.to_lowercase();
+    let mut out = String::new();
+
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if ch == ' ' || ch == '-' || ch == '_' {
+            out.push('_');
+        }
+    }
+
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+
+    out.trim_matches('_').to_string()
+}
+
+fn normalize_extension(ext: &str) -> &str {
+    match ext.to_lowercase().as_str() {
+        "jpeg" => "jpg",
+        "jpg" => "jpg",
+        "png" => "png",
+        "webp" => "webp",
+        _ => "jpg",
+    }
+}
+
 
 async fn root() -> &'static str {
     "¡Hola desde Rust y Axum!"
@@ -211,6 +333,228 @@ async fn root() -> &'static str {
 async fn saludo() -> Json<serde_json::Value> {
     Json(json!({ "mensaje": "Hola, bienvenido a mi API" }))
 }
+
+// endpoin para subir imagen del banner
+async fn subir_banner_imagen_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin(&headers, &state.admin_token) {
+        return resp;
+    }
+
+    let Some(field) = multipart.next_field().await.unwrap_or(None) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "No se recibió archivo" })),
+        )
+            .into_response();
+    };
+
+    let original_name = field
+        .file_name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "banner.jpg".to_string());
+
+    let data = match field.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("No se pudo leer archivo: {}", e) })),
+            )
+                .into_response()
+        }
+    };
+
+    let stem = StdPath::new(&original_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("banner");
+
+    let ext = StdPath::new(&original_name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("jpg");
+
+    let ext = normalize_extension(ext);
+    let clean_stem = sanitize_filename(stem);
+    let unique_name = format!("{}_{}.{}", clean_stem, Uuid::new_v4(), ext);
+    let ruta = format!("./static/images/{}", unique_name);
+
+    if let Err(e) = fs::write(&ruta, &data) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("No se pudo guardar imagen: {}", e) })),
+        )
+            .into_response();
+    }
+
+    let image_url = format!(
+        "{}/static/images/{}",
+        state.base_url.trim_end_matches('/'),
+        unique_name
+    );
+
+    (
+        StatusCode::OK,
+        Json(UploadBannerImageResponse {
+            success: true,
+            archivo_imagen: unique_name,
+            image_url,
+        }),
+    )
+        .into_response()
+}
+
+//=======================
+// ENDPOIND PARA ELIMINAR PRODUCTO DE BANNER
+//=========================================
+async fn eliminar_banner_admin(
+    Path(id): Path<i32>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin(&headers, &state.admin_token) {
+        return resp;
+    }
+
+    let result = sqlx::query("DELETE FROM banners WHERE id = ?")
+        .bind(id)
+        .execute(&*state.db)
+        .await;
+
+    match result {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "mensaje": "Banner eliminado correctamente"
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            eprintln!("❌ Error eliminando banner: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "No se pudo eliminar el banner" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+//======================
+//ENDPOINT PARA CREAR BANNER
+//=========================
+async fn crear_banner_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<BannerInput>,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin(&headers, &state.admin_token) {
+        return resp;
+    }
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO banners
+        (nombre, referencia, costo, archivo_imagen, video_url, button_text, clicks, activo, orden)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+        "#,
+    )
+    .bind(&payload.nombre)
+    .bind(&payload.referencia)
+    .bind(payload.costo)
+    .bind(&payload.archivo_imagen)
+    .bind(&payload.video_url)
+    .bind(payload.button_text.as_deref().unwrap_or("Ver demostración"))
+    .bind(payload.activo)
+    .bind(payload.orden)
+    .execute(&*state.db)
+    .await;
+
+    match result {
+        Ok(r) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "id": r.last_insert_rowid(),
+                "mensaje": "Banner creado correctamente"
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            eprintln!("❌ Error creando banner: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "No se pudo crear el banner" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+//======================
+// ENDPOINT PARA ACTUALIZAR BANNER
+//===============================
+async fn actualizar_banner_admin(
+    Path(id): Path<i32>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<BannerInput>,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin(&headers, &state.admin_token) {
+        return resp;
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE banners
+        SET nombre = ?,
+            referencia = ?,
+            costo = ?,
+            archivo_imagen = ?,
+            video_url = ?,
+            button_text = ?,
+            activo = ?,
+            orden = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(&payload.nombre)
+    .bind(&payload.referencia)
+    .bind(payload.costo)
+    .bind(&payload.archivo_imagen)
+    .bind(&payload.video_url)
+    .bind(payload.button_text.as_deref().unwrap_or("Ver demostración"))
+    .bind(payload.activo)
+    .bind(payload.orden)
+    .bind(id)
+    .execute(&*state.db)
+    .await;
+
+    match result {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "mensaje": "Banner actualizado correctamente"
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            eprintln!("❌ Error actualizando banner: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "No se pudo actualizar el banner" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 
 // =======================
 // Productos
@@ -335,6 +679,55 @@ async fn obtener_productos(
     }
 }
 
+///======================
+//Handler de checkout
+///======================
+async fn crear_checkout(
+    State(_state): State<AppState>,
+    Json(payload): Json<CheckoutRequest>,
+) -> impl IntoResponse {
+    if payload.items.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": "El carrito está vacío"
+            })),
+        )
+            .into_response();
+    }
+
+    if payload.total <= 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": "Total inválido"
+            })),
+        )
+            .into_response();
+    }
+
+    let reference = format!("ORD-{}", Uuid::new_v4());
+
+    // Por ahora simulamos una URL de checkout.
+    // Aquí luego conectas Wompi / ePayco / PayU.
+    let checkout_url = format!(
+        "https://checkout.wompi.co/l/test-{}",
+        reference
+    );
+
+    (
+        StatusCode::OK,
+        Json(CheckoutResponse {
+            success: true,
+            checkout_url,
+            reference,
+        }),
+    )
+        .into_response()
+}
+
 async fn buscar_producto(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -453,13 +846,23 @@ async fn chatbot(Json(payload): Json<MensajeUsuario>) -> Json<serde_json::Value>
 // =======================
 // Banners
 // =======================
-
 async fn obtener_banners(State(state): State<AppState>) -> Json<Vec<Banner>> {
     let banners = sqlx::query_as::<_, Banner>(
         r#"
-        SELECT id, nombre,referencia, costo,  archivo_imagen, video_url, button_text, clicks
+        SELECT
+            id,
+            nombre,
+            referencia,
+            costo,
+            archivo_imagen,
+            video_url,
+            button_text,
+            clicks,
+            activo,
+            orden
         FROM banners
-        ORDER BY RANDOM()
+        WHERE activo = 1
+        ORDER BY orden ASC, id DESC
         "#,
     )
     .fetch_all(&*state.db)
