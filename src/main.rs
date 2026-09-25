@@ -1,30 +1,56 @@
+// =======================
+// AXUM CORE
+// =======================
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put, delete},
     Json, Router,
 };
 
-use chrono::Utc;
-use dotenv::dotenv;
-use hyper::Method;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{FromRow, SqlitePool};
-use std::{
-    collections::HashMap,
-    env, fs,
-    net::SocketAddr,
-    path::Path as StdPath,
-    sync::Arc,
-};
+// =======================
+// TOWER (CORS + STATIC FILES)
+// =======================
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
-use uuid::Uuid;
 
+// =======================
+// SERIALIZATION
+// =======================
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+// =======================
+// DATABASE (SQLX)
+// =======================
+use sqlx::{FromRow, Row, SqlitePool};
+use sqlx::sqlite::SqlitePoolOptions;
+
+// =======================
+// UTILS / GENERAL
+// =======================
+use uuid::Uuid;
+use chrono::Utc;
+use dotenv::dotenv;
+
+use std::{
+    collections::HashMap,
+    env,
+    fs,
+    net::SocketAddr,
+    sync::Arc,
+    path::Path as StdPath,
+};
+
+// =======================
+// HTTP CLIENT
+// =======================
+
+// =======================
+// CRYPTO (HMAC / SHA)
+// =======================
 // =======================
 // Estructuras de datos
 // =======================
@@ -124,32 +150,6 @@ struct MensajeUsuario {
     mensaje: String,
 }
 
-#[derive(Debug, Serialize)]
-struct MetricasResponse {
-    total_productos: i64,
-    valor_inventario: f64,
-    total_leads: i64,
-    leads_hoy: i64,
-    banners_clicks_total: i64,
-    top_productos_stock: Vec<StockBajoItem>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-struct StockBajoItem {
-    referencia: String,
-    categoria: String,
-    precio: f64,
-    imagen: String,
-    cantidad: i32,
-}
-#[derive(Debug, Serialize, Deserialize)]
-struct CheckoutItem {
-    id: i64,
-    name: String,
-    price: f64,
-    quantity: i32,
-    image_url: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CheckoutRequest {
@@ -169,10 +169,18 @@ struct CheckoutResponse {
     reference: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, FromRow)]
+struct BalanceSnapshot {
+    id: i64,
+    asset: String,
+    free: f64,
+    locked: f64,
+    captured_at: String,
+}
+
 // =======================
 // Estado compartido
 // =======================
-
 #[derive(Clone)]
 struct AppState {
     db: Arc<SqlitePool>,
@@ -180,7 +188,7 @@ struct AppState {
     admin_token: String,
     wompi_public_key: String,
     wompi_private_key: String,
-    wompi_integrity_key: String,	
+    wompi_integrity_key: String,
 }
 // =======================
 // Main
@@ -188,8 +196,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    dotenv().ok();
-
+    dotenv::from_path("/home/javier/api-rust/.env").ok();
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL no está definido en el entorno");
 
@@ -207,7 +214,6 @@ async fn main() {
 
     let wompi_integrity_key =
         env::var("WOMPI_INTEGRITY_KEY").unwrap_or_else(|_| "".to_string());
-
     println!("🟢 DB URL EN USO => {}", database_url);
     println!("🟢 BASE_URL => {}", base_url);
 
@@ -228,12 +234,16 @@ async fn main() {
         wompi_private_key,
         wompi_integrity_key,
     };
-
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+    	.allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
-
     let app = Router::new()
         .route("/", get(root))
         .route("/saludo", get(saludo))
@@ -258,6 +268,7 @@ async fn main() {
         .route("/admin/banners/{id}", put(actualizar_banner_admin))
         .route("/admin/banners/{id}", delete(eliminar_banner_admin))
         .route("/checkout/create", post(crear_checkout))
+	.route("/api/health", get(api_health))
         .nest_service("/static", ServeDir::new("./static"))
         .with_state(state.clone())
         .layer(cors);
@@ -333,8 +344,10 @@ async fn root() -> &'static str {
 async fn saludo() -> Json<serde_json::Value> {
     Json(json!({ "mensaje": "Hola, bienvenido a mi API" }))
 }
-
+//======================================
 // endpoin para subir imagen del banner
+//=====================================
+
 async fn subir_banner_imagen_admin(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -344,12 +357,24 @@ async fn subir_banner_imagen_admin(
         return resp;
     }
 
-    let Some(field) = multipart.next_field().await.unwrap_or(None) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "No se recibió archivo" })),
-        )
-            .into_response();
+    let next = multipart.next_field().await;
+
+    let field = match next {
+        Ok(Some(field)) => field,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "No se recibió ningún archivo en el multipart" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Error parsing multipart: {}", e) })),
+            )
+                .into_response();
+        }
     };
 
     let original_name = field
@@ -364,9 +389,17 @@ async fn subir_banner_imagen_admin(
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("No se pudo leer archivo: {}", e) })),
             )
-                .into_response()
+                .into_response();
         }
     };
+
+    if data.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "El archivo llegó vacío" })),
+        )
+            .into_response();
+    }
 
     let stem = StdPath::new(&original_name)
         .file_stem()
@@ -407,7 +440,6 @@ async fn subir_banner_imagen_admin(
     )
         .into_response()
 }
-
 //=======================
 // ENDPOIND PARA ELIMINAR PRODUCTO DE BANNER
 //=========================================
@@ -1291,4 +1323,161 @@ async fn eliminar_producto_imagen(
                 .into_response()
         }
     }
+}
+//==============
+//HELPER BINANCE
+//==============
+fn binance_base_url(mode: &str) -> &'static str {
+    match mode {
+        "mainnet" => "https://api.binance.com",
+        _ => "https://testnet.binance.vision",
+    }
+}
+fn sign_query(secret: &str, query: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC error");
+
+    mac.update(query.as_bytes());
+    let result = mac.finalize().into_bytes();
+
+    hex::encode(result)
+}
+async fn binance_signed_post(
+    state: &AppState,
+    path: &str,
+    extra_params: Vec<(&str, String)>,
+) -> Result<serde_json::Value, String> {
+
+    let client = Client::new();
+    let timestamp = Utc::now().timestamp_millis();
+
+    let mut params = vec![
+        ("timestamp", timestamp.to_string()),
+        ("recvWindow", "5000".to_string()),
+    ];
+
+    for item in extra_params {
+        params.push(item);
+    }
+
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let signature = sign_query(&state.binance_api_secret, &query);
+    let body = format!("{}&signature={}", query, signature);
+
+    let url = format!("{}{}", binance_base_url(&state.binance_mode), path);
+
+    let response = client
+        .post(url)
+        .header("X-MBX-APIKEY", &state.binance_api_key)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        return Err(text);
+    }
+
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+async fn binance_signed_get(
+    state: &AppState,
+    path: &str,
+    extra_params: Vec<(&str, String)>,
+) -> Result<serde_json::Value, String> {
+
+    let client = Client::new();
+    let timestamp = Utc::now().timestamp_millis();
+
+    let mut params = vec![
+        ("timestamp", timestamp.to_string()),
+        ("recvWindow", "5000".to_string()),
+    ];
+
+    for item in extra_params {
+        params.push(item);
+    }
+
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let signature = sign_query(&state.binance_api_secret, &query);
+
+    let url = format!(
+        "{}{}?{}&signature={}",
+        binance_base_url(&state.binance_mode),
+        path,
+        query,
+        signature
+    );
+
+    let response = client
+        .get(url)
+        .header("X-MBX-APIKEY", &state.binance_api_key)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        return Err(text);
+    }
+
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+//===================
+//binance_public_get
+//==================
+async fn binance_public_get(
+    state: &AppState,
+    path: &str,
+    params: Vec<(&str, String)>,
+) -> Result<serde_json::Value, String> {
+
+    let client = Client::new();
+
+    let query = if params.is_empty() {
+        "".to_string()
+    } else {
+        params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+
+    let url = if query.is_empty() {
+        format!("{}{}", binance_base_url(&state.binance_mode), path)
+    } else {
+        format!("{}{}?{}", binance_base_url(&state.binance_mode), path, query)
+    };
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        return Err(text);
+    }
+
+    serde_json::from_str(&text).map_err(|e| e.to_string())
 }

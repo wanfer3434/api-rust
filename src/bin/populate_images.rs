@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if exists.0 == 0 {
                     // Insertar producto nuevo con URL completa
                     let url = format!(
-                        "https://javier.tail33d395.ts.net/static/images/{}",
+			"http://127.0.0.1:3000/static/images/{}",
                         filename.replace(" ", "%20")
                     );
 

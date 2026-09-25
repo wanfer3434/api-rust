@@ -4,3 +4,9 @@
 /target/
 Cargo.lock
 /target
+.env
+*.log
+*.backup
+*.save.*
+db.sqlite
+db.sqlite-*
