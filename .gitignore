@@ -10,3 +10,5 @@ Cargo.lock
 *.save.*
 db.sqlite
 db.sqlite-*
+api-rust.pid
+*.pid
